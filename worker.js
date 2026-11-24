@@ -1,5 +1,5 @@
 /**
- * Nexora Proxy 3.3.2 — Cloudflare Workers（Service Worker 方式 / JSProxy 型）
+ * Nexora Proxy 3.4.0 — Cloudflare Workers（Service Worker 方式 / JSProxy 型）
  *
  * ・/_nx/home            ブラウザシェル（Persistent Browser Shell: タブ = iframe。トップレベルは遷移しない）
  * ・/_nx/start           シェル内タブのホーム（landing）   /_nx/landing: 単体表示のランディング（フォールバック）
@@ -13,10 +13,12 @@
  * ページ内の相対 URL / サブリソースは <base> と SW によって本来の URL で処理されます。
  */
 
+import { DurableObject } from "cloudflare:workers";
+
 /* ============================== 設定 ============================== */
 
-const NEXORA_VERSION = "3.3.2";
-const NX_CACHE_NAME = "nexora-static-v3.3.2";
+const NEXORA_VERSION = "3.4.0";
+const NX_CACHE_NAME = "nexora-static-v3.4.0";
 
 // URL の難読化に使うキー。好きな文字列に変えてよい（変えると、保存済みのブックマークや履歴のURLは開けなくなる）
 // ※これは「見た目を読めなくする」ための難読化で、暗号ではない。クライアントに配る JS にも含まれる
@@ -33,6 +35,17 @@ const P_LANDING = ROUTE + "/landing";   // 単体で開くランディング（�
 const PAGE_PREFIX = "/-----";
 const RW_PREFIX = "/~/";
 const P_RWJS = ROUTE + "/rw.js";
+
+// コミュニティ(共有チャット)。チャット本体を置く Worker(ハブ)のオリジン。
+// 他の Nexora はここを開く。末尾にスラッシュは付けない。
+const COMMUNITY_HUB = "https://nexora.wakame.workers.dev";
+const P_COMMUNITY = ROUTE + "/community";
+const P_CHAT_WS = ROUTE + "/chat";
+const CHAT_MAX_HISTORY = 200;       // 保存する履歴の件数
+const CHAT_MAX_TEXT = 500;          // 1メッセージの最大文字数
+const CHAT_MAX_NAME = 20;           // 名前の最大文字数
+const CHAT_RATE_COUNT = 5;          // CHAT_RATE_WINDOW_MS の間に送れる件数
+const CHAT_RATE_WINDOW_MS = 10000;
 // 書き換えモードを既定にするサイト(シェルのメニューでサイトごとに変更できる)
 const RW_DEFAULT_HOSTS = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
 // 書き換えモードで上流の応答から落とすヘッダ(content-length / content-encoding は残す)
@@ -2175,6 +2188,8 @@ async function route(request, url, env) {
   if (p === P_RWJS) return assetResponse(buildRwSource(), { "cache-control": "public, max-age=86400" });
   if (p === P_RELAY) return handleRelay(request, url);
   if (p === P_WS) return handleWebSocket(request, url, env);
+  if (p === P_COMMUNITY) return handleCommunityPage(url);
+  if (p === P_CHAT_WS) return handleChatWs(request, url, env);
   if (p === P_HOME || p === "/") return htmlResponse(ENABLE_SHELL ? buildShell() : buildLanding());
   if (p === P_START) return htmlResponse(buildLanding({ framed: true }));
   if (p === P_LANDING) return htmlResponse(buildLanding());
@@ -2794,6 +2809,247 @@ async function handleRewrite(request, url, env) {
   rh.set("cache-control", "private, no-cache");
   return rewriter.transform(new Response(upstream.body, { status, statusText: upstream.statusText, headers: rh }));
 }
+
+/* ============================== コミュニティ(共有チャット) ============================== */
+
+function handleCommunityPage(url) {
+  // ハブ以外の Worker から開かれたら、ハブへ送る
+  if (url.origin !== COMMUNITY_HUB) {
+    return new Response(null, {
+      status: 302,
+      headers: { location: COMMUNITY_HUB + P_COMMUNITY, "cache-control": "no-store" },
+    });
+  }
+  return htmlResponse(COMMUNITY_HTML);
+}
+
+function handleChatWs(request, url, env) {
+  if (!env || !env.CHAT_ROOM) return textResponse("Chat is not enabled on this Worker", 501);
+  if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
+    return textResponse("Expected WebSocket", 426);
+  }
+  // 他サイトのページからの接続を拒否
+  const origin = request.headers.get("origin");
+  if (origin) {
+    let host = "";
+    try { host = new URL(origin).host; } catch { /* ignore */ }
+    if (host !== url.host) return textResponse("Forbidden", 403);
+  }
+  const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("main"));
+  return stub.fetch(request);
+}
+
+export class ChatRoom extends DurableObject {
+  async fetch(request) {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("Expected WebSocket", { status: 426 });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    // Hibernation API: 誰も話していない間は DO が眠れるので無料枠に優しい
+    this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({ times: [] });
+
+    const history = (await this.ctx.storage.get("history")) || [];
+    server.send(JSON.stringify({ type: "init", history, online: this.ctx.getWebSockets().length }));
+    this.broadcastOnline();
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws, raw) {
+    if (typeof raw !== "string" || raw.length > 4000) return;
+    let data;
+    try { data = JSON.parse(raw); } catch { return; }
+    if (!data || data.type !== "msg") return;
+
+    const text = String(data.text || "").trim().slice(0, CHAT_MAX_TEXT);
+    const name = String(data.name || "").trim().slice(0, CHAT_MAX_NAME) || "名無し";
+    const cid = String(data.cid || "").slice(0, 36);
+    if (!text) return;
+
+    // 連投制限
+    const att = ws.deserializeAttachment() || { times: [] };
+    const now = Date.now();
+    const times = att.times.filter((t) => now - t < CHAT_RATE_WINDOW_MS);
+    if (times.length >= CHAT_RATE_COUNT) {
+      ws.send(JSON.stringify({ type: "error", text: "送信が早すぎます。少し待ってください" }));
+      return;
+    }
+    times.push(now);
+    ws.serializeAttachment({ times });
+
+    const msg = { id: crypto.randomUUID(), name, text, cid, ts: now };
+    const history = (await this.ctx.storage.get("history")) || [];
+    history.push(msg);
+    if (history.length > CHAT_MAX_HISTORY) history.splice(0, history.length - CHAT_MAX_HISTORY);
+    await this.ctx.storage.put("history", history);
+
+    const out = JSON.stringify({ type: "msg", msg });
+    for (const s of this.ctx.getWebSockets()) {
+      try { s.send(out); } catch { /* 切れた接続は無視 */ }
+    }
+  }
+
+  webSocketClose(ws) {
+    try { ws.close(1000, "bye"); } catch { /* ignore */ }
+    this.broadcastOnline(ws);
+  }
+
+  webSocketError(ws) {
+    this.broadcastOnline(ws);
+  }
+
+  broadcastOnline(exclude) {
+    const list = this.ctx.getWebSockets().filter((s) => s !== exclude);
+    const out = JSON.stringify({ type: "online", online: list.length });
+    for (const s of list) {
+      try { s.send(out); } catch { /* ignore */ }
+    }
+  }
+}
+
+const COMMUNITY_HTML = `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>コミュニティ</title>
+<style>
+:root{--bg:#121726;--panel:#1b2238;--line:#2a3350;--txt:#e9ecf5;--dim:#8d96b3;--acc:#6cb4ff;--mine:#26487a}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--txt);font:15px/1.5 system-ui,-apple-system,"Hiragino Sans","Segoe UI",sans-serif;display:flex;flex-direction:column;height:100dvh;overflow:hidden}
+header{flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:16px;font-weight:700}
+#status{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:13px}
+#dot{width:8px;height:8px;border-radius:50%;background:#e0a24a;transition:background .3s}
+#dot.on{background:#5fd08a}
+#list{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:14px 16px;display:flex;flex-direction:column;gap:10px;-webkit-overflow-scrolling:touch}
+.empty{margin:auto;color:var(--dim);text-align:center}
+.m{max-width:min(82%,560px);align-self:flex-start}
+.m .meta{display:flex;gap:8px;align-items:baseline;margin:0 4px 3px;font-size:12px;color:var(--dim)}
+.m .meta b{color:var(--txt);font-weight:600;font-size:13px}
+.m .body{background:var(--panel);border:1px solid var(--line);border-radius:4px 16px 16px 16px;padding:8px 12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.m.me{align-self:flex-end}
+.m.me .meta{justify-content:flex-end}
+.m.me .body{background:var(--mine);border-color:#34609c;border-radius:16px 4px 16px 16px}
+#err{flex:none;min-height:0;padding:0 16px;color:#ff9b9b;font-size:13px}
+#err:not(:empty){padding:6px 16px}
+form{flex:none;display:flex;flex-direction:column;gap:8px;padding:10px 12px calc(10px + env(safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
+.row{display:flex;gap:8px}
+input,textarea{font:inherit;font-size:16px;color:var(--txt);background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px 12px;outline:none;min-width:0}
+input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(108,180,255,.18)}
+#name{width:9em;flex:none}
+#text{flex:1;resize:none;height:44px;max-height:120px}
+button{flex:none;appearance:none;border:0;border-radius:12px;padding:0 20px;font:inherit;font-weight:700;color:#0c1426;background:var(--acc);cursor:pointer;transition:transform .12s,opacity .15s}
+button:active{transform:scale(.95)}
+button:disabled{opacity:.4;cursor:default}
+@media(max-width:480px){#name{width:7em}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<header>
+  <h1>みんなのチャット</h1>
+  <div id="status"><span id="dot"></span><span id="stext">接続中…</span></div>
+</header>
+<div id="list"><p class="empty">まだ誰も話していません。最初のひとことをどうぞ。</p></div>
+<div id="err"></div>
+<form id="form" autocomplete="off">
+  <div class="row">
+    <input id="name" type="text" maxlength="20" placeholder="名前" aria-label="名前">
+    <textarea id="text" maxlength="500" rows="1" placeholder="メッセージを入力（Enterで送信、Shift+Enterで改行）" aria-label="メッセージ"></textarea>
+    <button id="send" type="submit" disabled>送信</button>
+  </div>
+</form>
+<script>
+(function(){
+  var list=document.getElementById("list"),dot=document.getElementById("dot"),stext=document.getElementById("stext");
+  var err=document.getElementById("err"),form=document.getElementById("form");
+  var nameIn=document.getElementById("name"),textIn=document.getElementById("text"),sendBtn=document.getElementById("send");
+  var ws=null,retry=0,online=0,connected=false,errTimer=0;
+
+  var cid=null;
+  try{cid=localStorage.getItem("c_cid");if(!cid){cid=(crypto.randomUUID&&crypto.randomUUID())||String(Math.random()).slice(2);localStorage.setItem("c_cid",cid)}}catch(e){cid=cid||String(Math.random()).slice(2)}
+  try{nameIn.value=localStorage.getItem("c_name")||""}catch(e){}
+  nameIn.addEventListener("input",function(){try{localStorage.setItem("c_name",nameIn.value)}catch(e){}});
+
+  function setStatus(){
+    dot.className=connected?"on":"";
+    stext.textContent=connected?(online+"人が参加中"):"接続し直しています…";
+    sendBtn.disabled=!connected;
+  }
+  function showErr(t){
+    err.textContent=t;clearTimeout(errTimer);
+    errTimer=setTimeout(function(){err.textContent=""},4000);
+  }
+  function nearBottom(){return list.scrollHeight-list.scrollTop-list.clientHeight<80}
+  function pad(n){return n<10?"0"+n:""+n}
+  function fmt(ts){var d=new Date(ts);return pad(d.getHours())+":"+pad(d.getMinutes())}
+
+  function addMsg(m,forceScroll){
+    var stick=forceScroll||nearBottom();
+    var empty=list.querySelector(".empty");if(empty)empty.remove();
+    var box=document.createElement("div");box.className="m"+(m.cid&&m.cid===cid?" me":"");
+    var meta=document.createElement("div");meta.className="meta";
+    var b=document.createElement("b");b.textContent=m.name;
+    var t=document.createElement("span");t.textContent=fmt(m.ts);
+    meta.appendChild(b);meta.appendChild(t);
+    var body=document.createElement("div");body.className="body";body.textContent=m.text;
+    box.appendChild(meta);box.appendChild(body);list.appendChild(box);
+    while(list.children.length>300)list.removeChild(list.firstChild);
+    if(stick)list.scrollTop=list.scrollHeight;
+  }
+
+  function connect(){
+    var proto=location.protocol==="https:"?"wss:":"ws:";
+    ws=new WebSocket(proto+"//"+location.host+"/_nx/chat");
+    ws.addEventListener("open",function(){retry=0;connected=true;setStatus()});
+    ws.addEventListener("message",function(e){
+      var d;try{d=JSON.parse(e.data)}catch(x){return}
+      if(d.type==="init"){
+        list.textContent="";
+        if(!d.history.length){var p=document.createElement("p");p.className="empty";p.textContent="まだ誰も話していません。最初のひとことをどうぞ。";list.appendChild(p)}
+        d.history.forEach(function(m){addMsg(m,true)});
+        online=d.online;setStatus();
+      }else if(d.type==="msg"){addMsg(d.msg,d.msg.cid===cid)}
+      else if(d.type==="online"){online=d.online;setStatus()}
+      else if(d.type==="error"){showErr(d.text)}
+    });
+    ws.addEventListener("close",function(){
+      connected=false;setStatus();
+      var wait=Math.min(10000,1000*Math.pow(2,retry++));
+      setTimeout(connect,wait);
+    });
+    ws.addEventListener("error",function(){try{ws.close()}catch(x){}});
+  }
+
+  function send(){
+    var text=textIn.value.trim();
+    if(!text||!connected)return;
+    ws.send(JSON.stringify({type:"msg",name:nameIn.value,text:text,cid:cid}));
+    textIn.value="";textIn.style.height="44px";
+  }
+  form.addEventListener("submit",function(e){e.preventDefault();send()});
+  /* 日本語入力の変換確定の Enter では送信しない（isComposing / keyCode 229） */
+  textIn.addEventListener("keydown",function(e){
+    if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing&&e.keyCode!==229){e.preventDefault();send()}
+  });
+  textIn.addEventListener("input",function(){
+    textIn.style.height="44px";
+    textIn.style.height=Math.min(120,textIn.scrollHeight)+"px";
+  });
+  document.addEventListener("visibilitychange",function(){
+    if(!document.hidden&&!connected&&ws&&ws.readyState===WebSocket.CLOSED){retry=0;connect()}
+  });
+
+  setStatus();connect();
+})();
+</script>
+</body>
+</html>`;
 
 /* ============================== 検証 / 共通ユーティリティ ============================== */
 
@@ -3453,7 +3709,7 @@ try{
 const SHELL_JS = String.raw`(function(){
 "use strict";
 var ORIGIN=location.origin, HOME="nexora://home", MAXTABS=12;
-var P_START=@@PSTART@@, P_SW=@@PSW@@, SEARCH_BASE=@@SEARCH@@, ERUDA=@@ERUDA@@, RW_DEFAULT=@@RWDEF@@;
+var P_START=@@PSTART@@, P_SW=@@PSW@@, SEARCH_BASE=@@SEARCH@@, ERUDA=@@ERUDA@@, RW_DEFAULT=@@RWDEF@@, COMMUNITY=@@COMMUNITY@@;
 var $=function(id){return document.getElementById(id)};
 var app=$("app"), stage=$("stage"), tabl=$("tabl"), urlIn=$("url"), toastEl=$("toast"), bannerEl=$("banner");
 var tabs=[], active=null, seq=0, saveTimer=0, holdSave=false, savedForBanner=null;
@@ -3461,6 +3717,7 @@ var tabs=[], active=null, seq=0, saveTimer=0, holdSave=false, savedForBanner=nul
 /* ---------- helpers ---------- */
 function http(u){return /^https?:\/\//i.test(String(u))}
 function isHome(u){return u===HOME}
+function isCom(u){return String(u||"").indexOf(COMMUNITY)===0}
 function clean(u){
   u=String(u||"");
   for(var i=0;i<4;i++){
@@ -3486,6 +3743,7 @@ function frameReal(t){
 }
 function frameSrc(u){
   if(isHome(u))return ORIGIN+P_START;
+  if(isCom(u))return u;
   var c=clean(u);
   if(useRw(c)){var w=nxRwWrap(ORIGIN,c);if(w)return w}
   return ORIGIN+nxWrapUrl("",c);
@@ -3495,7 +3753,7 @@ function rwList(){try{var s=JSON.parse(localStorage.getItem("__nx_rwhosts")||"nu
 function rwMatch(host,list){host=String(host||"").toLowerCase();for(var i=0;i<list.length;i++){var d=list[i];if(host===d||host.endsWith("."+d))return true}return false}
 function useRw(u){try{return rwMatch(new URL(u).hostname,rwList())}catch(e){return false}}
 function syncRwToSw(){try{var c=navigator.serviceWorker&&navigator.serviceWorker.controller;if(c)c.postMessage({t:"nx-rw-hosts",list:rwList()})}catch(e){}}
-function hostOf(u){if(isHome(u))return "ホーム";try{return new URL(u).hostname||u}catch(e){return u}}
+function hostOf(u){if(isHome(u))return "ホーム";if(isCom(u))return "コミュニティ";try{return new URL(u).hostname||u}catch(e){return u}}
 function isUrl(s){s=(s||"").trim();if(!s)return false;var l=s.toLowerCase();if(l.indexOf("http://")===0||l.indexOf("https://")===0)return true;if(/\s/.test(s))return false;if(/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s))return true;return /[.][a-zA-Z]{2,}/.test(s)}
 function normalize(v){var t=(v||"").trim();if(!t)return null;if(isUrl(t)){var l=t.toLowerCase();var u=(l.indexOf("http://")===0||l.indexOf("https://")===0)?t:"https://"+t;return http(u)?u:null}return SEARCH_BASE+encodeURIComponent(t)}
 function toast(m){toastEl.textContent=m;toastEl.classList.add("show");clearTimeout(toast.t);toast.t=setTimeout(function(){toastEl.classList.remove("show")},2600)}
@@ -3551,7 +3809,7 @@ function meaningful(s){return s.tabs.some(function(t){var e=t.entries&&t.entries
 
 /* ---------- address bar ---------- */
 function syncChrome(){
-  var home=!active||isHome(cur(active).url);
+  var home=!active||isHome(cur(active).url)||isCom(cur(active).url);
   app.classList.toggle("nobar",home);
   var openBtn=$("open");
   openBtn.style.display=(app.classList.contains("min")&&!home)?"inline-flex":"none";
@@ -4054,7 +4312,8 @@ function buildShell() {
     .split("@@PSW@@").join(JSON.stringify(P_SW))
     .split("@@SEARCH@@").join(JSON.stringify(SEARCH_BASE))
     .split("@@ERUDA@@").join(JSON.stringify(ENABLE_ERUDA))
-    .split("@@RWDEF@@").join(JSON.stringify(RW_DEFAULT_HOSTS));
+    .split("@@RWDEF@@").join(JSON.stringify(RW_DEFAULT_HOSTS))
+    .split("@@COMMUNITY@@").join(JSON.stringify(COMMUNITY_HUB + P_COMMUNITY));
   return `<!doctype html>
 <html lang="ja" data-nx-shell>
 <head>
@@ -4253,7 +4512,7 @@ svg{display:block;fill:none;stroke:currentColor;stroke-width:2.1;stroke-linecap:
     <div class="m-setting">
       <button class="mi" id="m-rw" type="button" role="switch" aria-checked="false" disabled>
         <svg viewBox="0 0 24 24"><path d="M4 7h11M4 7l3-3M4 7l3 3M20 17H9M20 17l-3-3M20 17l-3 3"/></svg>
-        <span class="tx"><b>互換モード</b><small>サイトが正常に開かない・表示が崩れる場合に試してください。YouTubeなどはこのモードで動きます。</small></span>
+        <span class="tx"><b>互換モード</b><small>サイトが正常に開かない・表示が崩れる場合に試してください。</small></span>
         <span class="m-switch" aria-hidden="true"><i></i></span>
       </button>
       <small class="m-setting-note" id="m-rw-note">サイトを開くと切り替えできます</small>
@@ -4544,6 +4803,7 @@ ${framed ? "" : DEBUG_UI_HTML}
 <a class="q" href="${link("https://taikoapp.uk")}">taikoweb</a>
 <a class="q" href="${link("https://soraraw.net")}">まんがraw</a>
 <a class="q" href="${link("https://yahoo.co.jp")}">Yahoo</a>
+<a class="q" href="#" id="nx-community">コミュニティ</a>
 </div>
 <div class="rec" id="hist" style="display:none">
 <p style="text-align:center"><button id="hbtn" type="button" style="background:none;border:1px solid rgba(255,255,255,.2);color:#a0a0c0;border-radius:50px;padding:8px 18px;font-size:.85rem;cursor:pointer">最近開いたサイトを表示</button></p>
@@ -4564,6 +4824,7 @@ ${framed ? "" : DEBUG_UI_HTML}
 <div class="nx-log-body">
 <h3>2026年11月</h3>
 <dl>
+<dt>v3.4.0</dt><dd>共有コミュニティチャットを追加。ハブ Worker の Durable Object に最大200件の履歴を保存し、複数の Nexora サイトから同じチャットルームへ接続可能。ホームのコミュニティボタン、タブ表示、入力欄の統合に対応</dd>
 <dt>v3.3.2</dt><dd>ページ表示中は上部タブ列を折りたたみ、タブ一覧・新規タブ操作を下部バーに統合。ホーム画面では上部タブ列を維持。ノッチ部分の余白を確保し、下部バーの最小化・復元とフローティングボタンにアニメーションを追加</dd>
 <dt>v3.3.0</dt><dd>書き換えモードを追加(Relay 型。サイトごとに SW方式と切り替え可能。メニューの「互換モード」から。YouTube は既定で互換モード)。書き換えモードでは上流の応答(ステータス・content-length・206)をほぼそのまま返す</dd>
 <dt>v3.2.2</dt><dd>ゲーム互換モードが実際には有効にならない不具合を修正(対象サイトでは iframe を書き換えず CSP も外す)。静的キャッシュが保存されていなかった問題を修正(JS は script 用 / それ以外で別キーに)。古いキャッシュを自動削除。シェル内で top.location / parent.location を読むサイトのエラーを修正。動画診断の伏せ字処理を修正</dd>
@@ -4699,6 +4960,7 @@ document.getElementById('form').addEventListener('submit',function(e){e.preventD
 document.getElementById('hbtn').addEventListener('click',function(){var ul=document.getElementById('histl');if(ul.style.display!=='none'){ul.style.display='none';ul.textContent='';this.textContent='最近開いたサイトを表示';return}
 h.forEach(function(u){var li=document.createElement('li'),a=document.createElement('a');a.href=nxWrapUrl('',u);a.textContent=u;li.appendChild(a);ul.appendChild(li)});ul.style.display='';this.textContent='隠す'})}catch(e){}})();
 (function(){var b=document.getElementById('nx-lite');if(!b)return;function lab(){b.textContent='軽量モード: '+(document.documentElement.classList.contains('nx-lite')?'オン':'オフ')}lab();b.addEventListener('click',function(){var on=!document.documentElement.classList.contains('nx-lite');try{localStorage.setItem('__nx_lite',on?'1':'0')}catch(e){}location.reload()})})();
+document.getElementById('nx-community').addEventListener('click',function(e){e.preventDefault();var u=${JSON.stringify(COMMUNITY_HUB + P_COMMUNITY)};try{if(window.top!==window&&window.top.__nxShell&&window.top.__nxShell.openTab(u))return}catch(x){}location.href=u});
 try{sessionStorage.removeItem('__nx_try')}catch(e){}
 (function(){var st=document.getElementById('st');
 if(!('serviceWorker' in navigator)){st.textContent='このブラウザは Service Worker に対応していません';return}
