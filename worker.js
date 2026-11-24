@@ -1,5 +1,5 @@
 /**
- * Nexora Proxy 3.2.2 — Cloudflare Workers（Service Worker 方式 / JSProxy 型）
+ * Nexora Proxy 3.3.2 — Cloudflare Workers（Service Worker 方式 / JSProxy 型）
  *
  * ・/_nx/home            ブラウザシェル（Persistent Browser Shell: タブ = iframe。トップレベルは遷移しない）
  * ・/_nx/start           シェル内タブのホーム（landing）   /_nx/landing: 単体表示のランディング（フォールバック）
