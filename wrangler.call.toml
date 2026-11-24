@@ -1,0 +1,5 @@
+# wrangler.youtube.toml
+name = "youtube"
+main = "worker.js"
+compatibility_date = "2026-9-25"
+keep_vars = true
