@@ -1,5 +1,5 @@
 /**
- * Nexora Proxy 3.4.0 — Cloudflare Workers（Service Worker 方式 / JSProxy 型）
+ * Nexora Proxy 3.5.0 — Cloudflare Workers（Service Worker 方式 / JSProxy 型）
  *
  * ・/_nx/home            ブラウザシェル（Persistent Browser Shell: タブ = iframe。トップレベルは遷移しない）
  * ・/_nx/start           シェル内タブのホーム（landing）   /_nx/landing: 単体表示のランディング（フォールバック）
@@ -17,9 +17,8 @@ import { DurableObject } from "cloudflare:workers";
 
 /* ============================== 設定 ============================== */
 
-const NEXORA_VERSION = "3.4.0";
-const NX_CACHE_NAME = "nexora-static-v3.4.0";
-
+const NEXORA_VERSION = "3.5.0";
+const NX_CACHE_NAME = "nexora-static-v3.5.0";
 
 // URL の難読化に使うキー。好きな文字列に変えてよい（変えると、保存済みのブックマークや履歴のURLは開けなくなる）
 // ※これは「見た目を読めなくする」ための難読化で、暗号ではない。クライアントに配る JS にも含まれる
@@ -37,16 +36,41 @@ const PAGE_PREFIX = "/-----";
 const RW_PREFIX = "/~/";
 const P_RWJS = ROUTE + "/rw.js";
 
-// コミュニティ(共有チャット)。チャット本体を置く Worker(ハブ)のオリジン。
-// 他の Nexora はここを開く。末尾にスラッシュは付けない。
+// コミュニティ(共有チャット + メディア投稿)。末尾にスラッシュは付けない。
 const COMMUNITY_HUB = "https://nexora.wakame.workers.dev";
 const P_COMMUNITY = ROUTE + "/community";
 const P_CHAT_WS = ROUTE + "/chat";
-const CHAT_MAX_HISTORY = 200;       // 保存する履歴の件数
-const CHAT_MAX_TEXT = 500;          // 1メッセージの最大文字数
-const CHAT_MAX_NAME = 20;           // 名前の最大文字数
-const CHAT_RATE_COUNT = 5;          // CHAT_RATE_WINDOW_MS の間に送れる件数
+const P_POST = ROUTE + "/post";
+const P_MEDIA = ROUTE + "/media";
+const CHAT_MAX_HISTORY = 200;
+const CHAT_MAX_TEXT = 500;
+const CHAT_MAX_NAME = 20;
+const CHAT_RATE_COUNT = 5;
 const CHAT_RATE_WINDOW_MS = 10000;
+const CHAT_MAX_POSTS = 300;
+const CHAT_POST_TEXT = 500;
+const CHAT_POST_INTERVAL_MS = 5000;
+const CHAT_NAME_TTL_MS = 60 * 24 * 3600 * 1000;
+const CHAT_FAIL_MAX = 8;
+const CHAT_FAIL_WINDOW_MS = 10 * 60 * 1000;
+const MB = 1024 * 1024;
+const CHAT_MEDIA_TYPES = {
+  "image/jpeg": { kind: "image", ext: ".jpg", max: 10 * MB },
+  "image/png": { kind: "image", ext: ".png", max: 10 * MB },
+  "image/gif": { kind: "image", ext: ".gif", max: 10 * MB },
+  "image/webp": { kind: "image", ext: ".webp", max: 10 * MB },
+  "audio/mpeg": { kind: "audio", ext: ".mp3", max: 30 * MB },
+  "audio/mp4": { kind: "audio", ext: ".m4a", max: 30 * MB },
+  "audio/x-m4a": { kind: "audio", ext: ".m4a", max: 30 * MB },
+  "audio/aac": { kind: "audio", ext: ".aac", max: 30 * MB },
+  "audio/ogg": { kind: "audio", ext: ".ogg", max: 30 * MB },
+  "audio/wav": { kind: "audio", ext: ".wav", max: 30 * MB },
+  "audio/x-wav": { kind: "audio", ext: ".wav", max: 30 * MB },
+  "audio/webm": { kind: "audio", ext: ".weba", max: 30 * MB },
+  "video/mp4": { kind: "video", ext: ".mp4", max: 50 * MB },
+  "video/webm": { kind: "video", ext: ".webm", max: 50 * MB },
+  "video/quicktime": { kind: "video", ext: ".mov", max: 50 * MB },
+};
 // 書き換えモードを既定にするサイト(シェルのメニューでサイトごとに変更できる)
 const RW_DEFAULT_HOSTS = ["youtube.com", "youtu.be", "youtube-nocookie.com"];
 // 書き換えモードで上流の応答から落とすヘッダ(content-length / content-encoding は残す)
@@ -2191,6 +2215,8 @@ async function route(request, url, env) {
   if (p === P_WS) return handleWebSocket(request, url, env);
   if (p === P_COMMUNITY) return handleCommunityPage(url);
   if (p === P_CHAT_WS) return handleChatWs(request, url, env);
+  if (p === P_POST) return handlePost(request, url, env);
+  if (p.startsWith(P_MEDIA + "/")) return handleMedia(request, url, env);
   if (p === P_HOME || p === "/") return htmlResponse(ENABLE_SHELL ? buildShell() : buildLanding());
   if (p === P_START) return htmlResponse(buildLanding({ framed: true }));
   if (p === P_LANDING) return htmlResponse(buildLanding());
@@ -2811,246 +2837,247 @@ async function handleRewrite(request, url, env) {
   return rewriter.transform(new Response(upstream.body, { status, statusText: upstream.statusText, headers: rh }));
 }
 
-/* ============================== コミュニティ(共有チャット) ============================== */
+/* ============================== コミュニティ(共有チャット + 投稿) ============================== */
 
+function chatJson(obj, status) {
+  return new Response(JSON.stringify(obj), { status: status || 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+}
+function chatSameOrigin(request, url) {
+  const origin = request.headers.get("origin");
+  if (!origin) return true;
+  try { return new URL(origin).host === url.host; } catch { return false; }
+}
 function handleCommunityPage(url) {
-  // ハブ以外の Worker から開かれたら、ハブへ送る
-  if (url.origin !== COMMUNITY_HUB) {
-    return new Response(null, {
-      status: 302,
-      headers: { location: COMMUNITY_HUB + P_COMMUNITY, "cache-control": "no-store" },
-    });
-  }
+  if (url.origin !== COMMUNITY_HUB) return new Response(null, { status: 302, headers: { location: COMMUNITY_HUB + P_COMMUNITY, "cache-control": "no-store" } });
   return htmlResponse(COMMUNITY_HTML);
 }
-
 function handleChatWs(request, url, env) {
   if (!env || !env.CHAT_ROOM) return textResponse("Chat is not enabled on this Worker", 501);
-  if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
-    return textResponse("Expected WebSocket", 426);
-  }
-  // 他サイトのページからの接続を拒否
-  const origin = request.headers.get("origin");
-  if (origin) {
-    let host = "";
-    try { host = new URL(origin).host; } catch { /* ignore */ }
-    if (host !== url.host) return textResponse("Forbidden", 403);
-  }
-  const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("main"));
-  return stub.fetch(request);
+  if ((request.headers.get("upgrade") || "").toLowerCase() !== "websocket") return textResponse("Expected WebSocket", 426);
+  if (!chatSameOrigin(request, url)) return textResponse("Forbidden", 403);
+  return env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("main")).fetch(request);
 }
 
+async function handlePost(request, url, env) {
+  if (request.method !== "POST") return textResponse("Method Not Allowed", 405);
+  if (!env || !env.CHAT_ROOM) return textResponse("Chat is not enabled on this Worker", 501);
+  if (!chatSameOrigin(request, url)) return textResponse("Forbidden", 403);
+  const dec = (v) => { try { return decodeURIComponent(v || ""); } catch { return ""; } };
+  const name = dec(request.headers.get("x-chat-name"));
+  const pass = dec(request.headers.get("x-chat-pass"));
+  const text = dec(request.headers.get("x-post-text")).trim().slice(0, CHAT_POST_TEXT);
+  const fileName = dec(request.headers.get("x-file-name")).replace(/[\u0000-\u001F\u007F]/g, "").slice(0, 100);
+  const stub = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName("main"));
+  const auth = await stub.verify(name, pass);
+  if (!auth.ok) return chatJson({ error: auth.error }, auth.status || 401);
+  const rate = await stub.checkPostRate(auth.uid);
+  if (!rate.ok) return chatJson({ error: rate.error }, rate.status || 429);
+  const ctype = (request.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  const lenHeader = request.headers.get("content-length");
+  const declared = lenHeader ? Number(lenHeader) : null;
+  let media = null;
+  if (request.body) {
+    const info = CHAT_MEDIA_TYPES[ctype];
+    if (!info) return chatJson({ error: "対応していないファイル形式です" }, 415);
+    if (Number.isFinite(declared) && declared > info.max) return chatJson({ error: "ファイルが大きすぎます(上限 " + Math.round(info.max / MB) + "MB)" }, 413);
+    if (!env.MEDIA) return chatJson({ error: "この Worker ではファイル保存が有効になっていません" }, 501);
+    const key = crypto.randomUUID() + info.ext;
+    let actual = 0;
+    const limited = request.body.pipeThrough(new TransformStream({
+      transform(chunk, controller) {
+        actual += chunk.byteLength;
+        if (actual > info.max) throw new Error("MEDIA_TOO_LARGE");
+        controller.enqueue(chunk);
+      }
+    }));
+    try {
+      await env.MEDIA.put(key, limited, { httpMetadata: { contentType: ctype } });
+    } catch (err) {
+      try { await env.MEDIA.delete(key); } catch (_) {}
+      return chatJson({ error: err && err.message === "MEDIA_TOO_LARGE" ? "ファイルが大きすぎます(上限 " + Math.round(info.max / MB) + "MB)" : "ファイルを保存できませんでした" }, err && err.message === "MEDIA_TOO_LARGE" ? 413 : 500);
+    }
+    media = { key, kind: info.kind, mime: ctype, size: actual, name: fileName };
+  }
+  if (!text && !media) return chatJson({ error: "本文かファイルを入れてください" }, 400);
+  try {
+    const result = await stub.addPost({ name: auth.name, uid: auth.uid, admin: auth.admin, text, media });
+    if (!result.ok) {
+      if (media) { try { await env.MEDIA.delete(media.key); } catch (_) {} }
+      return chatJson({ error: result.error }, result.status || 429);
+    }
+  } catch (err) {
+    if (media) { try { await env.MEDIA.delete(media.key); } catch (_) {} }
+    return chatJson({ error: "投稿を保存できませんでした" }, 500);
+  }
+  return chatJson({ ok: true });
+}
+
+async function handleMedia(request, url, env) {
+  if (!env || !env.MEDIA) return textResponse("Media is not enabled on this Worker", 501);
+  if (request.method !== "GET" && request.method !== "HEAD") return textResponse("Method Not Allowed", 405);
+  let key = "";
+  try { key = decodeURIComponent(url.pathname.slice(P_MEDIA.length + 1)); } catch (_) {}
+  if (!/^[0-9a-f-]{36}\.[a-z0-9]{2,5}$/.test(key)) return textResponse("Not Found", 404);
+  const obj = await env.MEDIA.get(key, { range: request.headers });
+  if (!obj) return textResponse("Not Found", 404);
+  const h = new Headers(); obj.writeHttpMetadata(h); h.set("etag", obj.httpEtag);
+  h.set("accept-ranges", "bytes"); h.set("cache-control", "public, max-age=31536000, immutable");
+  h.set("x-content-type-options", "nosniff"); h.set("content-security-policy", "sandbox; default-src 'none'");
+  let status = 200;
+  if (request.headers.has("range") && obj.range) {
+    const size = obj.size, r = obj.range;
+    let a, b;
+    if (r.suffix !== undefined) { a = Math.max(0, size - r.suffix); b = size - 1; }
+    else { a = r.offset || 0; b = r.length !== undefined ? Math.min(size - 1, a + r.length - 1) : size - 1; }
+    h.set("content-range", "bytes " + a + "-" + b + "/" + size); h.set("content-length", String(b - a + 1)); status = 206;
+  } else h.set("content-length", String(obj.size));
+  return new Response(request.method === "HEAD" ? null : obj.body, { status, headers: h });
+}
+
+function chatNormName(s) { return String(s || "").normalize("NFKC").replace(/[\s\u200B-\u200F\u2060\uFEFF]/g, "").toLowerCase(); }
+function chatCleanName(s) { return String(s || "").normalize("NFKC").replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028\u2029\u2060\uFEFF]/g, "").replace(/\s+/g, " ").trim(); }
+async function chatHash(salt, pass) {
+  const d = new TextEncoder().encode(salt + ":" + pass);
+  const h = await crypto.subtle.digest("SHA-256", d);
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function chatEq(a, b) { a = String(a); b = String(b); if (a.length !== b.length) return false; let r = 0; for (let i=0;i<a.length;i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i); return r === 0; }
+
 export class ChatRoom extends DurableObject {
+  async login(rawName, rawPass) {
+    const name = chatCleanName(rawName), key = chatNormName(name);
+    if (!name || !key) return { ok:false, error:"名前を入力してください" };
+    if ([...name].length > CHAT_MAX_NAME) return { ok:false, error:"名前は" + CHAT_MAX_NAME + "文字までです" };
+    const pass = String(rawPass || "");
+    if (pass.length < 10 || pass.length > 64) return { ok:false, error:"合言葉は10〜64文字で入力してください" };
+    const now = Date.now(), fk = "f:" + key;
+    const f = (await this.ctx.storage.get(fk)) || { n:0, t:0 };
+    if (now - f.t > CHAT_FAIL_WINDOW_MS) f.n = 0;
+    if (f.n >= CHAT_FAIL_MAX) return { ok:false, error:"失敗が続いたため、しばらく待ってからやり直してください", status:429 };
+    const fail = async () => { f.n++; f.t=now; await this.ctx.storage.put(fk,f); return { ok:false, error:"その名前は使われています(合言葉が違います)" }; };
+    const adminKey = this.env.CHAT_ADMIN_NAME ? chatNormName(this.env.CHAT_ADMIN_NAME) : "";
+    if (adminKey && key === adminKey) {
+      const ap = String(this.env.CHAT_ADMIN_PASS || "");
+      if (!ap || !chatEq(pass, ap)) return fail();
+      if (f.n) await this.ctx.storage.delete(fk);
+      return { ok:true, name, uid:"admin", admin:true };
+    }
+    const uk = "u:" + key;
+    const fresh = { name, uid:crypto.randomUUID(), salt:crypto.randomUUID(), hash:"", last:now };
+    fresh.hash = await chatHash(fresh.salt, pass);
+    // トランザクションで名前の新規登録と既存アカウント照合を直列化
+    const outcome = await this.ctx.storage.transaction(async (txn) => {
+      const rec = await txn.get(uk);
+      if (!rec || now - rec.last > CHAT_NAME_TTL_MS) {
+        await txn.put(uk, fresh);
+        return { ok:true, name, uid:fresh.uid, created:true };
+      }
+      const h = await chatHash(rec.salt, pass);
+      if (!chatEq(h, rec.hash)) return { ok:false };
+      rec.last = now; rec.name = name;
+      await txn.put(uk, rec);
+      return { ok:true, name, uid:rec.uid };
+    });
+    if (!outcome.ok) return fail();
+    if (f.n) await this.ctx.storage.delete(fk);
+    return outcome;
+  }
+  async verify(name, pass) { return this.login(name, pass); }
+  async checkPostRate(uid) {
+    const last = (await this.ctx.storage.get("lp:" + uid)) || 0;
+    if (Date.now() - last < CHAT_POST_INTERVAL_MS) return { ok:false, error:"投稿が早すぎます。少し待ってください", status:429 };
+    return { ok:true };
+  }
+  async addPost(p) {
+    const now=Date.now(), lk="lp:"+p.uid, last=(await this.ctx.storage.get(lk))||0;
+    if (now-last < CHAT_POST_INTERVAL_MS) return { ok:false, error:"投稿が早すぎます。少し待ってください", status:429 };
+    const post={ id:crypto.randomUUID(), name:p.name, uid:p.uid, text:p.text||"", media:p.media||null, ts:now };
+    const posts=(await this.ctx.storage.get("posts"))||[]; posts.push(post);
+    while(posts.length>CHAT_MAX_POSTS){ const old=posts.shift(); if(old&&old.media&&this.env.MEDIA){try{await this.env.MEDIA.delete(old.media.key)}catch(_){}} }
+    await this.ctx.storage.put("posts",posts); await this.ctx.storage.put(lk,now);
+    this.broadcast({type:"post",post}); return {ok:true,id:post.id};
+  }
   async fetch(request) {
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("Expected WebSocket", { status: 426 });
-    }
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-
-    // Hibernation API: 誰も話していない間は DO が眠れるので無料枠に優しい
-    this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ times: [] });
-
-    const history = (await this.ctx.storage.get("history")) || [];
-    server.send(JSON.stringify({ type: "init", history, online: this.ctx.getWebSockets().length }));
-    this.broadcastOnline();
-
-    return new Response(null, { status: 101, webSocket: client });
+    if (request.headers.get("Upgrade") !== "websocket") return new Response("Expected WebSocket",{status:426});
+    const pair=new WebSocketPair(), client=pair[0], server=pair[1];
+    this.ctx.acceptWebSocket(server); server.serializeAttachment({times:[],name:"",uid:"",admin:false});
+    const history=(await this.ctx.storage.get("history"))||[], posts=(await this.ctx.storage.get("posts"))||[];
+    server.send(JSON.stringify({type:"init",history,posts,online:this.ctx.getWebSockets().length})); this.broadcastOnline();
+    return new Response(null,{status:101,webSocket:client});
   }
-
   async webSocketMessage(ws, raw) {
-    if (typeof raw !== "string" || raw.length > 4000) return;
-    let data;
-    try { data = JSON.parse(raw); } catch { return; }
-    if (!data || data.type !== "msg") return;
-
-    const text = String(data.text || "").trim().slice(0, CHAT_MAX_TEXT);
-    const name = String(data.name || "").trim().slice(0, CHAT_MAX_NAME) || "名無し";
-    const cid = String(data.cid || "").slice(0, 36);
-    if (!text) return;
-
-    // 連投制限
-    const att = ws.deserializeAttachment() || { times: [] };
-    const now = Date.now();
-    const times = att.times.filter((t) => now - t < CHAT_RATE_WINDOW_MS);
-    if (times.length >= CHAT_RATE_COUNT) {
-      ws.send(JSON.stringify({ type: "error", text: "送信が早すぎます。少し待ってください" }));
-      return;
+    if(typeof raw!=="string"||raw.length>4000)return;
+    let d;try{d=JSON.parse(raw)}catch(_){return} if(!d||typeof d!=="object")return;
+    const att=ws.deserializeAttachment()||{times:[],name:"",uid:"",admin:false};
+    const reply=o=>{try{ws.send(JSON.stringify(o))}catch(_){}};
+    if(d.type==="login"){
+      const r=await this.login(d.name,d.pass); if(!r.ok){reply({type:"login_error",text:r.error});return;}
+      ws.serializeAttachment({times:att.times||[],name:r.name,uid:r.uid,admin:!!r.admin});
+      reply({type:"login_ok",name:r.name,uid:r.uid,admin:!!r.admin,created:!!r.created}); return;
     }
-    times.push(now);
-    ws.serializeAttachment({ times });
-
-    const msg = { id: crypto.randomUUID(), name, text, cid, ts: now };
-    const history = (await this.ctx.storage.get("history")) || [];
-    history.push(msg);
-    if (history.length > CHAT_MAX_HISTORY) history.splice(0, history.length - CHAT_MAX_HISTORY);
-    await this.ctx.storage.put("history", history);
-
-    const out = JSON.stringify({ type: "msg", msg });
-    for (const s of this.ctx.getWebSockets()) {
-      try { s.send(out); } catch { /* 切れた接続は無視 */ }
+    if(d.type==="logout"){ws.serializeAttachment({times:att.times||[],name:"",uid:"",admin:false});return;}
+    if(!att.name||!att.uid){reply({type:"error",text:"先にログインしてください"});return;}
+    if(d.type==="msg"){
+      const text=String(d.text||"").trim().slice(0,CHAT_MAX_TEXT); if(!text)return;
+      const now=Date.now(), times=(att.times||[]).filter(t=>now-t<CHAT_RATE_WINDOW_MS);
+      if(times.length>=CHAT_RATE_COUNT){reply({type:"error",text:"送信が早すぎます。少し待ってください"});return;}
+      times.push(now); ws.serializeAttachment({times,name:att.name,uid:att.uid,admin:att.admin});
+      const msg={id:crypto.randomUUID(),name:att.name,uid:att.uid,text,ts:now};
+      const history=(await this.ctx.storage.get("history"))||[]; history.push(msg);
+      if(history.length>CHAT_MAX_HISTORY)history.splice(0,history.length-CHAT_MAX_HISTORY);
+      await this.ctx.storage.put("history",history); this.broadcast({type:"msg",msg}); return;
     }
-  }
-
-  webSocketClose(ws) {
-    try { ws.close(1000, "bye"); } catch { /* ignore */ }
-    this.broadcastOnline(ws);
-  }
-
-  webSocketError(ws) {
-    this.broadcastOnline(ws);
-  }
-
-  broadcastOnline(exclude) {
-    const list = this.ctx.getWebSockets().filter((s) => s !== exclude);
-    const out = JSON.stringify({ type: "online", online: list.length });
-    for (const s of list) {
-      try { s.send(out); } catch { /* ignore */ }
+    if(d.type==="delmsg"){
+      if(!att.admin)return; const id=String(d.id||""), history=(await this.ctx.storage.get("history"))||[];
+      const next=history.filter(m=>m.id!==id); if(next.length===history.length)return;
+      await this.ctx.storage.put("history",next); this.broadcast({type:"delmsg",id}); return;
+    }
+    if(d.type==="delpost"){
+      const id=String(d.id||""), posts=(await this.ctx.storage.get("posts"))||[], post=posts.find(x=>x.id===id);
+      if(!post||(!att.admin&&post.uid!==att.uid))return;
+      await this.ctx.storage.put("posts",posts.filter(x=>x.id!==id));
+      if(post.media&&this.env.MEDIA){try{await this.env.MEDIA.delete(post.media.key)}catch(_){}}
+      this.broadcast({type:"delpost",id});
     }
   }
+  webSocketClose(ws){this.broadcastOnline(ws);}
+  webSocketError(ws){this.broadcastOnline(ws);}
+  broadcast(obj,exclude){const out=JSON.stringify(obj);for(const s of this.ctx.getWebSockets()){if(s===exclude)continue;try{s.send(out)}catch(_){}}}
+  broadcastOnline(exclude){const n=this.ctx.getWebSockets().filter(s=>s!==exclude).length;this.broadcast({type:"online",online:n},exclude);}
 }
 
 const COMMUNITY_HTML = `<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>コミュニティ</title>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>コミュニティ</title>
 <style>
-:root{--bg:#121726;--panel:#1b2238;--line:#2a3350;--txt:#e9ecf5;--dim:#8d96b3;--acc:#6cb4ff;--mine:#26487a}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-body{background:var(--bg);color:var(--txt);font:15px/1.5 system-ui,-apple-system,"Hiragino Sans","Segoe UI",sans-serif;display:flex;flex-direction:column;height:100dvh;overflow:hidden}
-header{flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
-header h1{font-size:16px;font-weight:700}
-#status{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:13px}
-#dot{width:8px;height:8px;border-radius:50%;background:#e0a24a;transition:background .3s}
-#dot.on{background:#5fd08a}
-#list{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:14px 16px;display:flex;flex-direction:column;gap:10px;-webkit-overflow-scrolling:touch}
-.empty{margin:auto;color:var(--dim);text-align:center}
-.m{max-width:min(82%,560px);align-self:flex-start}
-.m .meta{display:flex;gap:8px;align-items:baseline;margin:0 4px 3px;font-size:12px;color:var(--dim)}
-.m .meta b{color:var(--txt);font-weight:600;font-size:13px}
-.m .body{background:var(--panel);border:1px solid var(--line);border-radius:4px 16px 16px 16px;padding:8px 12px;white-space:pre-wrap;overflow-wrap:anywhere}
-.m.me{align-self:flex-end}
-.m.me .meta{justify-content:flex-end}
-.m.me .body{background:var(--mine);border-color:#34609c;border-radius:16px 4px 16px 16px}
-#err{flex:none;min-height:0;padding:0 16px;color:#ff9b9b;font-size:13px}
-#err:not(:empty){padding:6px 16px}
-form{flex:none;display:flex;flex-direction:column;gap:8px;padding:10px 12px calc(10px + env(safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
-.row{display:flex;gap:8px}
-input,textarea{font:inherit;font-size:16px;color:var(--txt);background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:10px 12px;outline:none;min-width:0}
-input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(108,180,255,.18)}
-#name{width:9em;flex:none}
-#text{flex:1;resize:none;height:44px;max-height:120px}
-button{flex:none;appearance:none;border:0;border-radius:12px;padding:0 20px;font:inherit;font-weight:700;color:#0c1426;background:var(--acc);cursor:pointer;transition:transform .12s,opacity .15s}
-button:active{transform:scale(.95)}
-button:disabled{opacity:.4;cursor:default}
-@media(max-width:480px){#name{width:7em}}
-@media(prefers-reduced-motion:reduce){*{transition:none!important}}
-</style>
-</head>
-<body>
-<header>
-  <h1>みんなのチャット</h1>
-  <div id="status"><span id="dot"></span><span id="stext">接続中…</span></div>
-</header>
-<div id="list"><p class="empty">まだ誰も話していません。最初のひとことをどうぞ。</p></div>
-<div id="err"></div>
-<form id="form" autocomplete="off">
-  <div class="row">
-    <input id="name" type="text" maxlength="20" placeholder="名前" aria-label="名前">
-    <textarea id="text" maxlength="500" rows="1" placeholder="メッセージを入力（Enterで送信、Shift+Enterで改行）" aria-label="メッセージ"></textarea>
-    <button id="send" type="submit" disabled>送信</button>
-  </div>
-</form>
+:root{--bg:#121726;--panel:#1b2238;--line:#2a3350;--txt:#e9ecf5;--dim:#8d96b3;--acc:#6cb4ff;--mine:#26487a;--bad:#ff9b9b}*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%}body{background:var(--bg);color:var(--txt);font:15px/1.5 system-ui,-apple-system,"Hiragino Sans",sans-serif;display:flex;flex-direction:column;height:100dvh;overflow:hidden}header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--panel)}header h1{font-size:16px}#status{font-size:12px;color:var(--dim)}#dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#d99b43;margin-right:6px}#dot.on{background:#5fd08a}button{border:0;border-radius:11px;padding:0 15px;height:40px;font:inherit;font-weight:700;background:var(--acc);color:#10182a}button:disabled{opacity:.4}button.ghost{height:34px;padding:0 11px;background:#ffffff12;color:var(--txt);border:1px solid var(--line)}nav{display:flex;background:var(--panel)}nav button{flex:1;border-radius:0;background:none;color:var(--dim);border-bottom:2px solid transparent}nav button.on{color:var(--txt);border-bottom-color:var(--acc)}.pane{display:none;flex:1;min-height:0;flex-direction:column}.pane.on{display:flex}.scroll{flex:1;min-height:0;overflow:auto;padding:12px;-webkit-overflow-scrolling:touch}.empty{color:var(--dim);text-align:center;padding:30px 0}.m,.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:10px;margin-bottom:10px;overflow-wrap:anywhere}.m{max-width:85%;align-self:flex-start}.m.own{align-self:flex-end;background:var(--mine)}#list{display:flex;flex-direction:column;gap:8px}.meta{font-size:12px;color:var(--dim);display:flex;gap:8px;align-items:center;margin-bottom:5px}.meta b{color:var(--txt)}.body,.posttext{white-space:pre-wrap;overflow-wrap:anywhere}.del{display:none;margin-left:auto;height:26px;padding:0 7px;font-size:11px;background:none;color:var(--bad)}body.adm .del,.card.own .del{display:block}.bar{padding:10px;background:var(--panel);border-top:1px solid var(--line)}.row{display:flex;gap:8px;align-items:center}input,textarea{min-width:0;width:100%;font:inherit;font-size:16px;color:var(--txt);background:var(--bg);border:1px solid var(--line);border-radius:11px;padding:10px}textarea{resize:none;height:44px;max-height:120px}#composer{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:12px;display:grid;gap:9px}#ptext{height:64px}.media{display:block;width:100%;max-height:70vh;object-fit:contain;background:#000;border-radius:10px;margin-top:8px}audio.media{height:44px}#fname{font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#pprog{width:100%}.err{color:var(--bad);font-size:13px}#dlg{position:fixed;inset:0;z-index:5;background:#050812bb;display:flex;align-items:center;justify-content:center;padding:20px}#dlg[hidden]{display:none}#dbox{width:min(92vw,380px);background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;display:grid;gap:10px}#dbox p{font-size:12px;color:var(--dim)}@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body>
+<header><h1>コミュニティ</h1><div><span id="status"><i id="dot"></i><span id="stext">接続中…</span></span> <button id="who" class="ghost" type="button">ログイン</button></div></header>
+<nav><button class="tab on" data-t="chat" type="button">チャット</button><button class="tab" data-t="posts" type="button">投稿</button></nav>
+<section id="p-chat" class="pane on"><div id="list" class="scroll"><p class="empty">まだメッセージがありません。</p></div><div id="err" class="err"></div><form id="form" class="bar"><div class="row"><textarea id="text" maxlength="500" placeholder="メッセージ (Enterで送信)"></textarea><button id="send" disabled>送信</button></div></form></section>
+<section id="p-posts" class="pane"><div class="scroll"><div id="composer"><textarea id="ptext" maxlength="500" placeholder="投稿本文 (省略可)"></textarea><div class="row"><button id="pick" class="ghost" type="button">ファイルを選ぶ</button><span id="fname">画像 / 音声 / 動画</span><button id="pclear" class="ghost" type="button" hidden>外す</button></div><input id="pfile" type="file" hidden accept="image/jpeg,image/png,image/gif,image/webp,audio/*,video/mp4,video/webm,video/quicktime"><progress id="pprog" max="100" value="0" hidden></progress><div id="perr" class="err"></div><div style="text-align:right"><button id="pgo" type="button">投稿する</button></div></div><div id="feed"><p class="empty">まだ投稿がありません。</p></div></div></section>
+<div id="dlg" hidden><form id="dbox"><h2>ログイン / 名前登録</h2><p>初めて使う名前は登録されます。同じ名前を使うには同じ合言葉が必要です。合言葉は10文字以上にしてください。</p><input id="dname" maxlength="20" placeholder="名前"><input id="dpass" type="password" maxlength="64" placeholder="合言葉 (10文字以上)"><div id="derr" class="err"></div><div class="row" style="justify-content:flex-end"><button id="dout" class="ghost" type="button" hidden>ログアウト</button><button id="dcancel" class="ghost" type="button">閉じる</button><button type="submit">決定</button></div></form></div>
 <script>
 (function(){
-  var list=document.getElementById("list"),dot=document.getElementById("dot"),stext=document.getElementById("stext");
-  var err=document.getElementById("err"),form=document.getElementById("form");
-  var nameIn=document.getElementById("name"),textIn=document.getElementById("text"),sendBtn=document.getElementById("send");
-  var ws=null,retry=0,online=0,connected=false,errTimer=0;
-
-  var cid=null;
-  try{cid=localStorage.getItem("c_cid");if(!cid){cid=(crypto.randomUUID&&crypto.randomUUID())||String(Math.random()).slice(2);localStorage.setItem("c_cid",cid)}}catch(e){cid=cid||String(Math.random()).slice(2)}
-  try{nameIn.value=localStorage.getItem("c_name")||""}catch(e){}
-  nameIn.addEventListener("input",function(){try{localStorage.setItem("c_name",nameIn.value)}catch(e){}});
-
-  function setStatus(){
-    dot.className=connected?"on":"";
-    stext.textContent=connected?(online+"人が参加中"):"接続し直しています…";
-    sendBtn.disabled=!connected;
-  }
-  function showErr(t){
-    err.textContent=t;clearTimeout(errTimer);
-    errTimer=setTimeout(function(){err.textContent=""},4000);
-  }
-  function nearBottom(){return list.scrollHeight-list.scrollTop-list.clientHeight<80}
-  function pad(n){return n<10?"0"+n:""+n}
-  function fmt(ts){var d=new Date(ts);return pad(d.getHours())+":"+pad(d.getMinutes())}
-
-  function addMsg(m,forceScroll){
-    var stick=forceScroll||nearBottom();
-    var empty=list.querySelector(".empty");if(empty)empty.remove();
-    var box=document.createElement("div");box.className="m"+(m.cid&&m.cid===cid?" me":"");
-    var meta=document.createElement("div");meta.className="meta";
-    var b=document.createElement("b");b.textContent=m.name;
-    var t=document.createElement("span");t.textContent=fmt(m.ts);
-    meta.appendChild(b);meta.appendChild(t);
-    var body=document.createElement("div");body.className="body";body.textContent=m.text;
-    box.appendChild(meta);box.appendChild(body);list.appendChild(box);
-    while(list.children.length>300)list.removeChild(list.firstChild);
-    if(stick)list.scrollTop=list.scrollHeight;
-  }
-
-  function connect(){
-    var proto=location.protocol==="https:"?"wss:":"ws:";
-    ws=new WebSocket(proto+"//"+location.host+"/_nx/chat");
-    ws.addEventListener("open",function(){retry=0;connected=true;setStatus()});
-    ws.addEventListener("message",function(e){
-      var d;try{d=JSON.parse(e.data)}catch(x){return}
-      if(d.type==="init"){
-        list.textContent="";
-        if(!d.history.length){var p=document.createElement("p");p.className="empty";p.textContent="まだ誰も話していません。最初のひとことをどうぞ。";list.appendChild(p)}
-        d.history.forEach(function(m){addMsg(m,true)});
-        online=d.online;setStatus();
-      }else if(d.type==="msg"){addMsg(d.msg,d.msg.cid===cid)}
-      else if(d.type==="online"){online=d.online;setStatus()}
-      else if(d.type==="error"){showErr(d.text)}
-    });
-    ws.addEventListener("close",function(){
-      connected=false;setStatus();
-      var wait=Math.min(10000,1000*Math.pow(2,retry++));
-      setTimeout(connect,wait);
-    });
-    ws.addEventListener("error",function(){try{ws.close()}catch(x){}});
-  }
-
-  function send(){
-    var text=textIn.value.trim();
-    if(!text||!connected)return;
-    ws.send(JSON.stringify({type:"msg",name:nameIn.value,text:text,cid:cid}));
-    textIn.value="";textIn.style.height="44px";
-  }
-  form.addEventListener("submit",function(e){e.preventDefault();send()});
-  /* 日本語入力の変換確定の Enter では送信しない（isComposing / keyCode 229） */
-  textIn.addEventListener("keydown",function(e){
-    if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing&&e.keyCode!==229){e.preventDefault();send()}
-  });
-  textIn.addEventListener("input",function(){
-    textIn.style.height="44px";
-    textIn.style.height=Math.min(120,textIn.scrollHeight)+"px";
-  });
-  document.addEventListener("visibilitychange",function(){
-    if(!document.hidden&&!connected&&ws&&ws.readyState===WebSocket.CLOSED){retry=0;connect()}
-  });
-
-  setStatus();connect();
+var $=function(x){return document.getElementById(x)},list=$("list"),feed=$("feed"),ws=null,connected=false,online=0,retry=0,me=null,creds=null,pending=null,file=null,uploading=false,loginAuto=false;
+try{var c=JSON.parse(sessionStorage.getItem("c_creds")||"null");if(c&&c.name&&c.pass)creds=c}catch(e){}
+function escTime(ts){var d=new Date(ts);return (d.getMonth()+1)+"/"+d.getDate()+" "+("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2)}
+function say(el,t){el.textContent=t||""}function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))}
+function restyle(){document.body.classList.toggle("adm",!!(me&&me.admin));$("who").textContent=me?me.name+(me.admin?" ★":""):"ログイン";$("send").disabled=!connected||!me;$("stext").textContent=connected?online+"人が参加中":"接続し直しています…";$("dot").className=connected?"on":"";document.querySelectorAll(".m,.card").forEach(function(x){x.classList.toggle("own",!!(me&&x.dataset.uid===me.uid))})}
+function empty(container,msg){container.textContent="";var p=document.createElement("p");p.className="empty";p.textContent=msg;container.appendChild(p)}
+function addMsg(m){var e=list.querySelector(".empty");if(e)e.remove();var x=document.createElement("div");x.className="m";x.dataset.id=m.id;x.dataset.uid=m.uid||"";var meta=document.createElement("div"),b=document.createElement("b"),t=document.createElement("span"),del=document.createElement("button");meta.className="meta";b.textContent=m.name;t.textContent=escTime(m.ts);del.className="del";del.type="button";del.textContent="削除";meta.append(b,t,del);var body=document.createElement("div");body.className="body";body.textContent=m.text;x.append(meta,body);list.appendChild(x);if(list.scrollHeight-list.scrollTop-list.clientHeight<120)list.scrollTop=list.scrollHeight;restyle()}
+function mediaNode(m){var u="/_nx/media/"+encodeURIComponent(m.key),el;if(m.kind==="image"){el=document.createElement("img");el.alt=m.name||"投稿画像";el.loading="lazy";el.src=u}else if(m.kind==="audio"){el=document.createElement("audio");el.controls=true;el.preload="none";el.src=u}else{el=document.createElement("video");el.controls=true;el.playsInline=true;el.preload="metadata";el.src=u}el.className="media";return el}
+function addPost(p,top){var e=feed.querySelector(".empty");if(e)e.remove();var c=document.createElement("article");c.className="card";c.dataset.id=p.id;c.dataset.uid=p.uid||"";var meta=document.createElement("div"),b=document.createElement("b"),t=document.createElement("span"),del=document.createElement("button");meta.className="meta";b.textContent=p.name;t.textContent=escTime(p.ts);del.className="del";del.type="button";del.textContent="削除";meta.append(b,t,del);c.appendChild(meta);if(p.text){var tx=document.createElement("div");tx.className="posttext";tx.textContent=p.text;c.appendChild(tx)}if(p.media){c.appendChild(mediaNode(p.media));if(p.media.name){var cap=document.createElement("div");cap.className="meta";cap.textContent=p.media.name;c.appendChild(cap)}}if(top)feed.insertBefore(c,feed.firstChild);else feed.appendChild(c);restyle()}
+list.addEventListener("click",function(e){var b=e.target;if(!b.classList.contains("del"))return;var x=b.closest(".m");if(x&&confirm("このメッセージを削除しますか？"))wsSend({type:"delmsg",id:x.dataset.id})});feed.addEventListener("click",function(e){var b=e.target;if(!b.classList.contains("del"))return;var x=b.closest(".card");if(x&&confirm("この投稿を削除しますか？"))wsSend({type:"delpost",id:x.dataset.id})});
+function connect(){var proto=location.protocol==="https:"?"wss:":"ws:";ws=new WebSocket(proto+"//"+location.host+"/_nx/chat");ws.onopen=function(){retry=0;connected=true;restyle();if(creds){pending=creds;loginAuto=true;wsSend({type:"login",name:creds.name,pass:creds.pass})}};ws.onmessage=function(e){var d;try{d=JSON.parse(e.data)}catch(x){return}if(d.type==="init"){empty(list,"まだメッセージがありません。");empty(feed,"まだ投稿がありません。");(d.history||[]).forEach(addMsg);(d.posts||[]).forEach(function(p){addPost(p,false)});online=d.online||0;restyle()}else if(d.type==="msg")addMsg(d.msg);else if(d.type==="post")addPost(d.post,true);else if(d.type==="delmsg"){var m=list.querySelector('[data-id="'+d.id+'"]');if(m)m.remove()}else if(d.type==="delpost"){var p=feed.querySelector('[data-id="'+d.id+'"]');if(p)p.remove()}else if(d.type==="online"){online=d.online;restyle()}else if(d.type==="login_ok"){me={name:d.name,uid:d.uid,admin:!!d.admin};creds=pending||creds;try{sessionStorage.setItem("c_creds",JSON.stringify(creds))}catch(x){}loginAuto=false;$ ("dlg").hidden=true;restyle()}else if(d.type==="login_error"){var was=loginAuto;loginAuto=false;if(was){creds=null;try{sessionStorage.removeItem("c_creds")}catch(x){}}openLogin(was?"保存中のログインが使えません: "+d.text:d.text)}else if(d.type==="error")say($("err"),d.text)};ws.onclose=function(){connected=false;restyle();setTimeout(connect,Math.min(10000,1000*Math.pow(2,retry++)))};ws.onerror=function(){try{ws.close()}catch(x){}}}
+function openLogin(msg){$("dlg").hidden=false;say($("derr"),msg);$("dname").value=(me&&me.name)||(creds&&creds.name)||$("dname").value||"";$("dpass").value="";$("dout").hidden=!me}
+$("who").onclick=function(){openLogin("")};$("dcancel").onclick=function(){$("dlg").hidden=true};$("dout").onclick=function(){wsSend({type:"logout"});me=null;creds=null;try{sessionStorage.removeItem("c_creds")}catch(e){}restyle();$("dlg").hidden=true};$("dbox").onsubmit=function(e){e.preventDefault();var n=$("dname").value.trim(),p=$("dpass").value;if(!n){say($("derr"),"名前を入力してください");return}if(p.length<10){say($("derr"),"合言葉は10文字以上にしてください");return}if(!connected){say($("derr"),"接続中です");return}pending={name:n,pass:p};loginAuto=false;wsSend({type:"login",name:n,pass:p})};
+$("form").onsubmit=function(e){e.preventDefault();var t=$("text").value.trim();if(!t)return;if(!me){openLogin("");return}if(connected){wsSend({type:"msg",text:t});$("text").value=""}};$("text").onkeydown=function(e){if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing&&e.keyCode!==229){e.preventDefault();$("form").requestSubmit()}};
+var tabs=document.querySelectorAll(".tab");tabs.forEach(function(b){b.onclick=function(){tabs.forEach(function(x){x.classList.toggle("on",x===b)});$("p-chat").classList.toggle("on",b.dataset.t==="chat");$("p-posts").classList.toggle("on",b.dataset.t==="posts")}});
+$("pick").onclick=function(){$("pfile").click()};$("pfile").onchange=function(){file=this.files&&this.files[0]||null;if(file){$("fname").textContent=file.name+" ("+(file.size/1048576).toFixed(1)+"MB)";$("pclear").hidden=false}};function clearFile(){file=null;$("pfile").value="";$("fname").textContent="画像 / 音声 / 動画";$("pclear").hidden=true}$("pclear").onclick=clearFile;
+$("pgo").onclick=function(){if(uploading)return;if(!me||!creds){openLogin("");return}var txt=$("ptext").value.trim();if(!txt&&!file){say($("perr"),"本文かファイルを入れてください");return}if(file&&file.size>50*1048576){say($("perr"),"ファイルが大きすぎます");return}uploading=true;$("pgo").disabled=true;var prog=$("pprog");prog.hidden=!file;prog.value=0;var x=new XMLHttpRequest();x.open("POST","/_nx/post");x.setRequestHeader("x-chat-name",encodeURIComponent(creds.name));x.setRequestHeader("x-chat-pass",encodeURIComponent(creds.pass));x.setRequestHeader("x-post-text",encodeURIComponent(txt));if(file){x.setRequestHeader("content-type",file.type||"application/octet-stream");x.setRequestHeader("x-file-name",encodeURIComponent(file.name))}x.upload.onprogress=function(e){if(e.lengthComputable)prog.value=Math.round(e.loaded*100/e.total)};x.onload=function(){uploading=false;$("pgo").disabled=false;prog.hidden=true;if(x.status===200){$("ptext").value="";clearFile();say($("perr"),"")}else{var m="投稿できませんでした";try{m=JSON.parse(x.responseText).error||m}catch(e){}say($("perr"),m)}};x.onerror=function(){uploading=false;$("pgo").disabled=false;prog.hidden=true;say($("perr"),"通信に失敗しました")};x.send(file||null)};
+restyle();connect();
 })();
-</script>
-</body>
-</html>`;
+</script></body></html>`;
 
 /* ============================== 検証 / 共通ユーティリティ ============================== */
 
@@ -4825,6 +4852,7 @@ ${framed ? "" : DEBUG_UI_HTML}
 <div class="nx-log-body">
 <h3>2026年11月</h3>
 <dl>
+<dt>v3.5.0</dt><dd>コミュニティをv2に更新。名前登録・合言葉ログイン、重複名防止、管理者/本人による削除、画像・音声・動画のR2投稿に対応。投稿上限・容量制限・連投制限を追加</dd>
 <dt>v3.4.0</dt><dd>共有コミュニティチャットを追加。ハブ Worker の Durable Object に最大200件の履歴を保存し、複数の Nexora サイトから同じチャットルームへ接続可能。ホームのコミュニティボタン、タブ表示、入力欄の統合に対応</dd>
 <dt>v3.3.2</dt><dd>ページ表示中は上部タブ列を折りたたみ、タブ一覧・新規タブ操作を下部バーに統合。ホーム画面では上部タブ列を維持。ノッチ部分の余白を確保し、下部バーの最小化・復元とフローティングボタンにアニメーションを追加</dd>
 <dt>v3.3.0</dt><dd>書き換えモードを追加(Relay 型。サイトごとに SW方式と切り替え可能。メニューの「互換モード」から。YouTube は既定で互換モード)。書き換えモードでは上流の応答(ステータス・content-length・206)をほぼそのまま返す</dd>
