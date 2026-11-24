@@ -20,6 +20,7 @@ import { DurableObject } from "cloudflare:workers";
 const NEXORA_VERSION = "3.4.0";
 const NX_CACHE_NAME = "nexora-static-v3.4.0";
 
+
 // URL の難読化に使うキー。好きな文字列に変えてよい（変えると、保存済みのブックマークや履歴のURLは開けなくなる）
 // ※これは「見た目を読めなくする」ための難読化で、暗号ではない。クライアントに配る JS にも含まれる
 const NX_KEY = "nexora-change-this-key";
