@@ -4253,7 +4253,7 @@ svg{display:block;fill:none;stroke:currentColor;stroke-width:2.1;stroke-linecap:
     <div class="m-setting">
       <button class="mi" id="m-rw" type="button" role="switch" aria-checked="false" disabled>
         <svg viewBox="0 0 24 24"><path d="M4 7h11M4 7l3-3M4 7l3 3M20 17H9M20 17l-3-3M20 17l-3 3"/></svg>
-        <span class="tx"><b>互換モード</b><small>サイトが正常に開かない・表示が崩れる場合に試してください。</small></span>
+        <span class="tx"><b>互換モード</b><small>サイトが正常に開かない・表示が崩れる場合に試してください。YouTubeなどはこのモードで動きます。</small></span>
         <span class="m-switch" aria-hidden="true"><i></i></span>
       </button>
       <small class="m-setting-note" id="m-rw-note">サイトを開くと切り替えできます</small>
