@@ -7,9 +7,6 @@ keep_vars = true
 name = "CHAT_ROOM"
 class_name = "ChatRoom"
 
-[[r2_buckets]]
-binding = "MEDIA"
-bucket_name = "nexora-media"
 
 [[migrations]]
 tag = "v1"
