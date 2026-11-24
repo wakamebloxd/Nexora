@@ -1,12 +1,15 @@
-# wrangler.youtube.toml
-name = "youtube"
+name = "nexora"
 main = "worker.js"
-compatibility_date = "2026-11-23"
+compatibility_date = "2026-11-24"
 keep_vars = true
 
 [[durable_objects.bindings]]
 name = "CHAT_ROOM"
 class_name = "ChatRoom"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "nexora-media"
 
 [[migrations]]
 tag = "v1"
