@@ -1,5 +1,5 @@
 /**
- * Nexora Proxy 3.6.0 — Cloudflare Workers（Service Worker 方式 / JSProxy 型）
+ * Nexora Proxy 3.6.1 — Cloudflare Workers（Service Worker 方式 / JSProxy 型）
  *
  * ・/_nx/home            ブラウザシェル（Persistent Browser Shell: タブ = iframe。トップレベルは遷移しない）
  * ・/_nx/start           シェル内タブのホーム（landing）   /_nx/landing: 単体表示のランディング（フォールバック）
@@ -17,8 +17,8 @@ import { DurableObject } from "cloudflare:workers";
 
 /* ============================== 設定 ============================== */
 
-const NEXORA_VERSION = "3.6.0";
-const NX_CACHE_NAME = "nexora-static-v3.6.0";
+const NEXORA_VERSION = "3.6.1";
+const NX_CACHE_NAME = "nexora-static-v3.6.1";
 
 // URL の難読化に使うキー。好きな文字列に変えてよい（変えると、保存済みのブックマークや履歴のURLは開けなくなる）
 // ※これは「見た目を読めなくする」ための難読化で、暗号ではない。クライアントに配る JS にも含まれる
@@ -5214,6 +5214,25 @@ a.q{display:inline-flex;align-items:center;gap:8px;padding:10px 22px;border-radi
 .nx-home-ready a.q{opacity:1;transform:none}.nx-home-ready a.q:nth-child(1){transition-delay:.08s}.nx-home-ready a.q:nth-child(2){transition-delay:.14s}.nx-home-ready a.q:nth-child(3){transition-delay:.20s}
 a.q:hover{background:rgba(102,126,234,.22);border-color:#667eea;transform:translateY(-2px);box-shadow:0 8px 22px rgba(75,65,180,.14)}
 a.q:active{transform:scale(.96)}
+
+/* ---- featured community panel: independent home UI, not a QuickLink ---- */
+.nx-community-panel{position:relative;display:flex;align-items:center;gap:16px;margin:30px auto 0;padding:20px 20px 20px 18px;width:100%;text-align:left;overflow:hidden;border:1px solid rgba(173,145,255,.42);border-radius:20px;background:linear-gradient(112deg,rgba(91,67,178,.27),rgba(28,25,67,.76) 48%,rgba(34,29,79,.68));box-shadow:0 10px 34px rgba(8,5,30,.28),inset 0 1px 0 rgba(255,255,255,.08);opacity:0;transform:translateY(16px) scale(.985);transition:opacity .7s ease,transform .8s cubic-bezier(.22,1,.36,1),border-color .25s,box-shadow .25s}
+.nx-home-ready .nx-community-panel{opacity:1;transform:none;transition-delay:.18s}
+.nx-community-panel::before{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(105deg,transparent 12%,rgba(191,169,255,.12) 48%,transparent 82%);transform:translateX(-120%);animation:nxCommunitySweep 5.5s ease-in-out 1.2s infinite}
+@keyframes nxCommunitySweep{0%,35%{transform:translateX(-120%)}72%,100%{transform:translateX(120%)}}
+.nx-community-mark{position:relative;z-index:1;flex:none;width:58px;height:58px;display:grid;place-items:center;border-radius:17px;color:#eee8ff;background:linear-gradient(145deg,rgba(153,121,255,.34),rgba(91,67,178,.2));border:1px solid rgba(207,190,255,.3);box-shadow:0 0 24px rgba(139,103,255,.18)}
+.nx-community-mark svg{width:29px;height:29px;fill:none;stroke:currentColor;stroke-width:1.65;stroke-linecap:round;stroke-linejoin:round}
+.nx-community-copy{position:relative;z-index:1;flex:1;min-width:0}
+.nx-community-kicker{display:flex;align-items:center;gap:7px;margin-bottom:5px;color:#c2b0ff;font-size:.68rem;font-weight:700;letter-spacing:.16em}
+.nx-community-kicker i{width:6px;height:6px;border-radius:50%;background:#a78bfa;box-shadow:0 0 9px #a78bfa}
+.nx-community-title{font-size:1.12rem;font-weight:700;letter-spacing:.025em;color:#fff}
+.nx-community-desc{margin-top:4px;color:#b9b4d6;font-size:.78rem;line-height:1.5}
+#nx-community{position:relative;z-index:1;flex:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:11px 15px;border:1px solid rgba(211,198,255,.35);border-radius:13px;background:linear-gradient(135deg,#8064e8,#6046b4);color:#fff;text-decoration:none;font-size:.82rem;font-weight:700;white-space:nowrap;box-shadow:0 5px 18px rgba(88,62,180,.28);transition:transform .2s,filter .2s,box-shadow .2s}
+#nx-community svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+#nx-community:hover{transform:translateY(-2px);filter:brightness(1.12);box-shadow:0 8px 24px rgba(105,79,210,.4)}
+#nx-community:active{transform:scale(.96)}
+@media(max-width:480px){.nx-community-panel{gap:12px;padding:16px 14px}.nx-community-mark{width:48px;height:48px;border-radius:14px}.nx-community-mark svg{width:25px;height:25px}.nx-community-title{font-size:1rem}.nx-community-desc{font-size:.72rem}#nx-community{padding:10px 11px;font-size:.76rem;gap:5px}}
+@media(max-width:370px){.nx-community-panel{flex-wrap:wrap}.nx-community-copy{min-width:calc(100% - 64px)}#nx-community{margin-left:60px}}
 .h{margin-top:20px;font-size:.82rem;color:#585870}
 #st{margin-top:10px;font-size:.78rem;color:#686880;min-height:1em}
 .rec{margin-top:32px;text-align:left}
@@ -5343,11 +5362,21 @@ ${framed ? "" : DEBUG_UI_HTML}
 </div></form>
 <p id="st"></p>
 <div id="nx-session" style="display:none;margin:12px 0 18px"><button id="nx-session-restore" type="button" style="background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.14);color:#ddd9ff;border-radius:12px;padding:10px 16px;font-size:.85rem;cursor:pointer">↩ 前回のセッションを復元</button><button id="nx-session-dismiss" type="button" style="display:none;background:none;border:0;color:#777791;margin-left:8px;font-size:.78rem;cursor:pointer">閉じる</button><div id="nx-session-label" style="margin-top:7px;font-size:.7rem;color:#777791;word-break:break-all"></div></div>
+<section class="nx-community-panel" aria-label="Nexora Community">
+  <div class="nx-community-mark" aria-hidden="true">
+    <svg viewBox="0 0 24 24"><path d="M16 20v-1.4a3.6 3.6 0 0 0-3.6-3.6H6.6A3.6 3.6 0 0 0 3 18.6V20"/><circle cx="9.5" cy="7.5" r="3.5"/><path d="M17 11.5a3.4 3.4 0 0 0 0-6.6M17.5 15h.9a3.6 3.6 0 0 1 2.6 3.4V20"/></svg>
+  </div>
+  <div class="nx-community-copy">
+    <div class="nx-community-kicker"><i></i> NEXORA COMMUNITY</div>
+    <div class="nx-community-title">みんなのコミュニティ</div>
+    <div class="nx-community-desc">チャットで交流、画像・音声・動画を投稿しよう。</div>
+  </div>
+  <a href="#" id="nx-community">開く <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></a>
+</section>
 <div class="ql">
 <a class="q" href="${link("https://taikoapp.uk")}">taikoweb</a>
 <a class="q" href="${link("https://soraraw.net")}">まんがraw</a>
 <a class="q" href="${link("https://yahoo.co.jp")}">Yahoo</a>
-<a class="q" href="#" id="nx-community">コミュニティ</a>
 </div>
 <div class="rec" id="hist" style="display:none">
 <p style="text-align:center"><button id="hbtn" type="button" style="background:none;border:1px solid rgba(255,255,255,.2);color:#a0a0c0;border-radius:50px;padding:8px 18px;font-size:.85rem;cursor:pointer">最近開いたサイトを表示</button></p>
@@ -5368,6 +5397,7 @@ ${framed ? "" : DEBUG_UI_HTML}
 <div class="nx-log-body">
 <h3>2026年11月</h3>
 <dl>
+<dt>v3.6.1</dt><dd>ホーム画面のコミュニティを独立した大型パネルに変更。QuickLinkから分離し、説明・専用アイコン・目立つ起動ボタンを追加</dd>
 <dt>v3.6.0</dt><dd>コミュニティをv3に更新。画像・音声・動画をR2ではなくDurable ObjectのSQLiteへ1MiB単位で保存。R2バケット設定を不要化。投稿上限・ファイル容量制限を調整。本人削除の識別子を固定し、合言葉は10文字以上・ログイン情報はタブのセッション内のみ保存</dd>
 <dt>v3.5.0</dt><dd>コミュニティをv2に更新。名前登録・合言葉ログイン、重複名防止、管理者/本人による削除、画像・音声・動画のR2投稿に対応。投稿上限・容量制限・連投制限を追加</dd>
 <dt>v3.4.0</dt><dd>共有コミュニティチャットを追加。ハブ Worker の Durable Object に最大200件の履歴を保存し、複数の Nexora サイトから同じチャットルームへ接続可能。ホームのコミュニティボタン、タブ表示、入力欄の統合に対応</dd>
