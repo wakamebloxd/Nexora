@@ -1,0 +1,4 @@
+name = "nexora2"
+main = "worker.js"
+compatibility_date = "2026-11-25"
+keep_vars = true
