@@ -17,8 +17,8 @@ import { DurableObject } from "cloudflare:workers";
 
 /* ============================== 設定 ============================== */
 
-const NEXORA_VERSION = "3.6.1";
-const NX_CACHE_NAME = "nexora-static-v3.6.1";
+const NEXORA_VERSION = "3.6.2";
+const NX_CACHE_NAME = "nexora-static-v3.6.2";
 
 // URL の難読化に使うキー。好きな文字列に変えてよい（変えると、保存済みのブックマークや履歴のURLは開けなくなる）
 // ※これは「見た目を読めなくする」ための難読化で、暗号ではない。クライアントに配る JS にも含まれる
@@ -3319,7 +3319,7 @@ audio.media{height:44px;background:none}
 <nav><button class="tab on" type="button" data-t="chat">チャット</button><button class="tab" type="button" data-t="posts">投稿</button></nav>
 
 <section id="p-chat" class="pane on">
-  <div id="list" class="scroll"><p class="empty">まだ誰も話していません。最初のひとことをどうぞ。</p></div>
+  <div id="list" class="scroll"><p class="empty">まだ誰もいません。</p></div>
   <div id="err" class="err"></div>
   <form id="form" class="bar" autocomplete="off">
     <div class="row">
@@ -3350,7 +3350,7 @@ audio.media{height:44px;background:none}
 <div id="dlg" hidden>
   <form id="dbox" autocomplete="off">
     <h2>ログイン / 名前を決める</h2>
-    <p>初めて使う名前は、そのまま登録されます。同じ名前でもう一度入るときは、同じ合言葉が必要です(別の端末でも同じ名前を使えます)。</p>
+    <p>初めての名前はそのまま登録されます。同じ名前で入るには同じ合言葉が要ります。</p>
     <input id="dname" type="text" maxlength="20" placeholder="名前(20文字まで)" aria-label="名前">
     <input id="dpass" type="password" maxlength="64" placeholder="合言葉(10文字以上)" aria-label="合言葉">
     <div id="derr"></div>
@@ -3372,7 +3372,10 @@ audio.media{height:44px;background:none}
   var EXT={jpg:"image/jpeg",jpeg:"image/jpeg",png:"image/png",gif:"image/gif",webp:"image/webp",mp3:"audio/mpeg",m4a:"audio/mp4",aac:"audio/aac",ogg:"audio/ogg",wav:"audio/wav",weba:"audio/webm",mp4:"video/mp4",webm:"video/webm",mov:"video/quicktime"};
   var LIM={image:5,audio:15,video:30};
 
-  try{var sc=JSON.parse(sessionStorage.getItem("c_creds")||"null");if(sc&&sc.name&&sc.pass)creds=sc}catch(e){}
+  function loadCreds(){var s=["localStorage","sessionStorage"];for(var i=0;i<s.length;i++){try{var v=JSON.parse(window[s[i]].getItem("c_creds")||"null");if(v&&v.name&&v.pass)return v}catch(e){}}return null}
+  function saveCreds(c){try{localStorage.setItem("c_creds",JSON.stringify(c))}catch(e){try{sessionStorage.setItem("c_creds",JSON.stringify(c))}catch(x){}}}
+  function clearCreds(){try{localStorage.removeItem("c_creds")}catch(e){}try{sessionStorage.removeItem("c_creds")}catch(e){}}
+  creds=loadCreds();
 
   function pad(n){return n<10?"0"+n:""+n}
   function fmt(ts,full){var d=new Date(ts),t=pad(d.getHours())+":"+pad(d.getMinutes());return full?((d.getMonth()+1)+"/"+d.getDate()+" "+t):t}
@@ -3510,7 +3513,7 @@ audio.media{height:44px;background:none}
   });
   $("dout").addEventListener("click",function(){
     sendWs({type:"logout"});me=null;creds=null;
-    try{sessionStorage.removeItem("c_creds")}catch(e){}
+    clearCreds();
     restyle();closeLogin();
   });
 
@@ -3526,7 +3529,7 @@ audio.media{height:44px;background:none}
       var d;try{d=JSON.parse(e.data)}catch(x){return}
       if(d.type==="init"){
         list.textContent="";feed.textContent="";
-        if(!d.history.length){var p=document.createElement("p");p.className="empty";p.textContent="まだ誰も話していません。最初のひとことをどうぞ。";list.appendChild(p)}
+        if(!d.history.length){var p=document.createElement("p");p.className="empty";p.textContent="まだ誰もいません。";list.appendChild(p)}
         d.history.forEach(function(m){addMsg(m,true)});
         if(!d.posts.length){var q=document.createElement("p");q.className="empty";q.textContent="まだ投稿がありません。";feed.appendChild(q)}
         for(var i=d.posts.length-1;i>=0;i--)renderPost(d.posts[i],false);
@@ -3539,10 +3542,10 @@ audio.media{height:44px;background:none}
       else if(d.type==="login_ok"){
         me={name:d.name,admin:!!d.admin};
         creds=pending||creds;
-        try{sessionStorage.setItem("c_creds",JSON.stringify(creds))}catch(x){}
+        saveCreds(creds);
         loginAuto=false;closeLogin();restyle();
       }else if(d.type==="login_error"){
-        if(loginAuto){creds=null;try{sessionStorage.removeItem("c_creds")}catch(x){}}
+        if(loginAuto&&/合言葉が違います/.test(d.text)){creds=null;clearCreds()}
         var wasAuto=loginAuto;loginAuto=false;
         openLogin(wasAuto?"保存してあったログインが使えませんでした: "+d.text:d.text);
       }else if(d.type==="error"){showErr(err,d.text)}
@@ -5367,9 +5370,9 @@ ${framed ? "" : DEBUG_UI_HTML}
     <svg viewBox="0 0 24 24"><path d="M16 20v-1.4a3.6 3.6 0 0 0-3.6-3.6H6.6A3.6 3.6 0 0 0 3 18.6V20"/><circle cx="9.5" cy="7.5" r="3.5"/><path d="M17 11.5a3.4 3.4 0 0 0 0-6.6M17.5 15h.9a3.6 3.6 0 0 1 2.6 3.4V20"/></svg>
   </div>
   <div class="nx-community-copy">
-    <div class="nx-community-kicker"><i></i> NEXORA COMMUNITY</div>
-    <div class="nx-community-title">みんなのコミュニティ</div>
-    <div class="nx-community-desc">チャットで交流、画像・音声・動画を投稿しよう。</div>
+    <div class="nx-community-kicker"><i></i> COMMUNITY</div>
+    <div class="nx-community-title">コミュニティ</div>
+    <div class="nx-community-desc">チャットと投稿(画像・音声・動画)</div>
   </div>
   <a href="#" id="nx-community">開く <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></a>
 </section>
@@ -5397,7 +5400,8 @@ ${framed ? "" : DEBUG_UI_HTML}
 <div class="nx-log-body">
 <h3>2026年11月</h3>
 <dl>
-<dt>v3.6.1</dt><dd>ホーム画面のコミュニティを独立した大型パネルに変更。QuickLinkから分離し、説明・専用アイコン・目立つ起動ボタンを追加</dd>
+<dt>v3.6.2</dt><dd>コミュニティのログインが毎回切れる問題を修正。ログイン情報を端末に保存するようにした。説明文を簡潔に変更</dd>
+<dt>v3.6.1</dt><dd>ホームのコミュニティを独立したパネルに変更</dd>
 <dt>v3.6.0</dt><dd>コミュニティをv3に更新。画像・音声・動画をR2ではなくDurable ObjectのSQLiteへ1MiB単位で保存。R2バケット設定を不要化。投稿上限・ファイル容量制限を調整。本人削除の識別子を固定し、合言葉は10文字以上・ログイン情報はタブのセッション内のみ保存</dd>
 <dt>v3.5.0</dt><dd>コミュニティをv2に更新。名前登録・合言葉ログイン、重複名防止、管理者/本人による削除、画像・音声・動画のR2投稿に対応。投稿上限・容量制限・連投制限を追加</dd>
 <dt>v3.4.0</dt><dd>共有コミュニティチャットを追加。ハブ Worker の Durable Object に最大200件の履歴を保存し、複数の Nexora サイトから同じチャットルームへ接続可能。ホームのコミュニティボタン、タブ表示、入力欄の統合に対応</dd>
